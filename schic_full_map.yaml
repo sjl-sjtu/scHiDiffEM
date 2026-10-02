@@ -1,0 +1,180 @@
+# C2: geometric-Z + EM, improved.
+#  - diffusion runs on normalized Z̃ = Z / z_scale
+#  - cosine schedule + Min-SNR-γ DSM weighting
+#  - periodic GPA gauge alignment
+#  - conditional score net + classifier-free guidance (replaces DPS)
+
+data:
+  scool_path: ./example.scool 
+  chrom: auto
+  num_workers: 0
+
+  min_total_contacts: 50000
+  cell_total_cache: ./cell_total_counts.json
+  use_info_nnz_filter: false
+  exclude_chroms_for_filter:
+    - chrY
+    - chrM
+    - chrEBV
+  min_contacts: 0
+
+model:
+  K: 10                   # latent rank per cell (Z_n in R^{MxK}); per-cell DEVIATION
+  band_width: 50          # E-step / likelihood band; also score-net cond dim
+  cond_drop_prob: 0.15    # CFG: prob of dropping x_tilde condition during DSM
+
+  band_bias:
+    hidden_dim: 64
+    num_layers: 3
+
+  resnet1d:
+    base_channels: 32
+    num_res_blocks: 2
+
+diffusion:
+  num_timesteps: 1000
+  schedule: cosine        # 'cosine' (default) | 'linear'
+  cosine_s: 0.008
+  beta_start: 0.0001      # only used when schedule = linear
+  beta_end: 0.02
+  t_min: 10               # prior score evaluated at this timestep (MAP E-step)
+
+training:
+  em_iterations: 50
+
+  # UNIFIED method for E-step + inference (kept consistent):
+  #   map --MAP point estimate (unconditional net). Robust, default.
+  #   dps --posterior sampling + likelihood guidance (unconditional net).
+  #   cfg --posterior sampling + classifier-free guidance (conditional net).
+  # dps/cfg use a sampling E-step (after warmup) so train/inference match;
+  # they need a strong generative prior (more dsm_epochs / em_iters).
+  method: map
+  sample_steps: 100        # reverse-diffusion steps for dps/cfg (E-step + inference)
+  dps_guidance_scale: 1.0  # dps likelihood-guidance strength
+  sample_clip: 2.5         # static thresholding of x_hat (normalized) --prevents dps/cfg
+                           # reverse-sampling divergence ->NaN; smaller = safer
+
+  # ---- E-step (Adam MAP) ----
+  K_E: 20
+  lr_e: 1.0e-2
+
+  batch_size_e: 64
+  batch_size_m: 64
+  batch_size_dsm: 64
+
+  # ---- M-step ----
+  m_epochs: 1
+  dsm_epochs: 5
+  lr_m: 1.0e-3
+  lr_m_dsm: 1.0e-4
+  ema_decay: 0.9999
+  min_snr_gamma: 5.0      # Min-SNR-gamma DSM loss weighting
+
+  # ---- MAP prior schedule ----
+  # A pseudo-bulk-pretrained prior is active from EM iteration 0. Its fixed PnP
+  # relaxation grows independently of the raw-NB data-consistency update.
+  warmup_iters: 0
+  prior_weight_start: 0.02
+  prior_weight: 0.10
+  prior_ramp_iters: 10
+  # Alternate raw-NB data consistency with a diffusion denoising proximal step.
+  # prior_weight is the fixed relaxation in Z <- Z_data + weight*(D(Z_data)-Z_data).
+  map_prior_mode: denoise
+  map_denoise_scaling: fixed
+  map_denoise_max_rel: 0.05  # max applied correction as a fraction of ||Z||
+  map_t_start: 250
+  map_denoise_samples: 2
+
+  # Condition every pseudo-bulk DSM update and every single-cell MAP denoise
+  # update on the same soft unsupervised population assignment. The condition
+  # is a probability vector over clean_prior_init.max_clusters; it changes the
+  # diffusion prior, never averages neighbor output maps.
+  population_conditioning:
+    enabled: true
+    temperature: 1.0
+
+  # Train the denoiser on the actual restoration direction, not Gaussian DSM
+  # alone. Each clean pseudo-bulk seed is sampled at a real single-cell
+  # exposure, fitted with the observation model to obtain a sparse corrupted
+  # latent, and paired with its clean seed under the same population condition.
+  population_recovery:
+    enabled: true
+    corruptions_per_seed: 1
+    factor_epochs: 20
+    factor_lr: 1.0e-2
+    batch_size: 32
+    loss_weight: 1.0
+    t_min: 10
+    t_max: 250
+
+  # ---- Raw-count NB observation model ----
+  # y[n,i,d] ~ NB(mean=cell_depth[n] * clean_rate[n,i,d], dispersion=theta[d]).
+  # All zeros remain supervised. NB over-dispersion softens false-zero pressure
+  # without a learned zero-inflation gate or an arbitrary zero-only loss weight.
+  exposure_min: 0.05
+  exposure_max: 20.0
+  nb_init_theta: 5.0
+  nb_theta_min: 0.1
+  nb_theta_max: 100.0
+
+  # ---- Clean-ish diffusion-prior bootstrap ----
+  # bandnorm is used only to cluster cells. Each target is a depth-normalized
+  # raw-count mini-pseudo-bulk, then factorized into Z before DSM pretraining.
+  clean_prior_init:
+    enabled: true
+    n_clusters: auto       # ceil(N/cells_per_cluster), clipped below
+    cells_per_cluster: 200
+    min_clusters: 16
+    max_clusters: 32
+    group_size: 16
+    max_seeds: 320
+    feature_bins: 64
+    max_strata: 15
+    factor_epochs: 100
+    factor_lr: 1.0e-2
+    pretrain_epochs: 20
+    replay_fraction: 0.20
+    seed_only_dsm: true    # keep sparse cell posteriors out of the clean prior
+    seed_noise: 0.02
+    random_seed: 0
+
+  # ---- GPA gauge alignment ----
+  gpa_init: false          # seeds are aligned before score pretraining
+  gpa_every: 0            # do not rotate Z away from the trained seed-prior gauge
+  gpa_iter: 10
+  gpa_tol: 1.0e-5
+
+  # ---- CFG inference (sample_posterior) ----
+  cfg_scale: 2.0          # 1.0 = pure conditional; >1 amplifies guidance
+  cfg_num_steps: 100
+  cfg_sigma_type: ddim    # 'ddim' (deterministic) | 'ddpm' (stochastic)
+
+  # ---- Auxiliary observation preprocessing ----
+  # method selects x_aux for initialization/conditioning/proposals only.
+  # The EM likelihood itself uses raw counts plus exposure above.
+  #   rwr            --scHiCluster random-walk imputation (needs schicluster)
+  #   bandnorm       --BandNorm per-cell per-band depth normalization ->log1p
+  #   bandnorm_smooth--bandnorm + Gaussian smoothing along genomic axis
+  #   raw_log1p      --log1p of raw counts (rawest auxiliary input)
+  preprocess:
+    method: bandnorm
+    smooth_sigma: 1.0       # only used by bandnorm_smooth
+  # RWR-specific kwargs (merged into preprocess cfg when method=rwr).
+  rwr_target:
+    cache_dir: null
+    n_jobs: 8
+    batch_size: 64
+    pad: 1
+    std: 1.0
+    rp: 0.5
+    tol: 0.01
+    logscale: false
+    output_dist: 500000000
+    min_cutoff: 1.0e-6
+
+  checkpoint_every: 10
+
+
+logging:
+  dir: ./logs
+  wandb: true
